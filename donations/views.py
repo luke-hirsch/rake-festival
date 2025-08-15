@@ -24,13 +24,16 @@ class IndexView(TemplateView):
         if goal:
             target = goal.target_amount
             title = goal.title
+            description = goal.description
         else:
             target = Decimal("100.00")
             title = "Fundraiser"
+            description = "Hilf mit deiner Spende"
 
         ctx.update({
             "title": title,
             "target": f"{target.quantize(Decimal('0.01'))}",
+            "description": description
         })
         return ctx
 

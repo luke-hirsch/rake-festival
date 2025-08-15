@@ -13,7 +13,7 @@ Tiny fundraiser site:
 
 ## Stack
 
-- Django 4/5, HTMX (progress polling), Tailwind CDN
+- Django 5, HTMX (progress polling), Tailwind CDN
 - Celery + Redis (broker/result)
 - SQLite (file DB)
 - Optional: PayPal REST (Business account)

@@ -1,21 +1,23 @@
 <!-- donations/templates/donations/index.html -->
 {% csrf_token %}
 <!doctype html>
-<html lang="de">
+<html lang="de" class="bg-zinc-950 text-neutral-100">
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{{ title|default:"Fundraiser" }}</title>
-        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <script src="https://unpkg.com/htmx.org@1.9.12"></script>
         {% if paypal_client_id %}
         <script src="https://www.paypal.com/sdk/js?client-id={{ paypal_client_id }}&currency=EUR&intent=capture"></script>
         {% endif %}
     </head>
     <body
-        class="min-h-screen bg-neutral-950 text-neutral-100 flex items-center justify-center p-6"
+        class="min-h-screen bg-linear-to-b from-indigo-500 via-purple-400 via-65% to-pink-400 flex items-center justify-center"
     >
-        <main class="w-full max-w-xl space-y-6">
+        <main
+            class="p-4 bg-zinc-950 rounded-md drop-shadow w-full max-w-xl space-y-6"
+        >
             <h1 class="text-3xl font-semibold text-center">
                 {{ title|default:"Fundraiser" }}
             </h1>
@@ -29,7 +31,7 @@
             >
                 <div class="space-y-2">
                     <div class="flex items-baseline justify-between">
-                        <span class="text-sm text-neutral-400">Ziel</span>
+                        <span class="text-sm text-neutral-400">Kosten</span>
                         <span class="tabular-nums font-medium">–</span>
                     </div>
                     <div
@@ -42,7 +44,7 @@
                     </div>
                     <div class="flex items-baseline justify-between">
                         <span class="text-sm text-neutral-400"
-                            >Eingegangen</span
+                            >Aktuelle Spenden</span
                         >
                         <span class="tabular-nums font-semibold">–</span>
                     </div>
@@ -155,9 +157,8 @@
                 >
                     Mit PayPal spenden
                 </a>
-                <p class="text-xs text-neutral-400 text-center">
-                    Hinweis: Für die direkte API-Integration bitte
-                    PAYPAL_CLIENT_ID & PAYPAL_SECRET setzen.
+                <p class="mt-2 text-xs text-neutral-400 text-center">
+                    {{description}}
                 </p>
             </section>
             {% endif %}
