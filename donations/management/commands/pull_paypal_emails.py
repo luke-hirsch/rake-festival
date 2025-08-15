@@ -1,226 +1,263 @@
+# donations/management/commands/pull_paypal_emails.py
 import email
 import imaplib
 import json
 import os
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, Tuple
 
 from django.core.management.base import BaseCommand, CommandError
-from django.conf import settings
-from django.utils.timezone import now
+from django.db import transaction
+from django.utils import timezone
 
-from donations.models import Donation
 from donations.utils import parse_paypal_email
+from donations import models as donation_models
+
+# Resolve models (your project used Donor/Doner at different times)
+Donation = donation_models.Donation
+Donor = getattr(donation_models, "Donor", None)
+Doner = getattr(donation_models, "Doner", None)  # legacy name fallback
 
 
-def _get_text_from_message(msg: email.message.Message) -> str:
+def _imap_connect(host: str, user: str, password: str) -> imaplib.IMAP4_SSL:
+    M = imaplib.IMAP4_SSL(host)
+    M.login(user, password)
+    return M
+
+
+def _select_folder(M: imaplib.IMAP4_SSL, folder: str) -> None:
+    typ, _ = M.select(folder)
+    if typ != "OK":
+        raise CommandError(f"Could not select folder {folder!r}")
+
+
+def _search_ids(M: imaplib.IMAP4_SSL, limit: int) -> list[bytes]:
+    # Process UNSEEN first; if none, scan last N of ALL
+    typ, data = M.search(None, "UNSEEN")
+    if typ == "OK":
+        ids = [i for i in data[0].split() if i]
+        if ids:
+            return ids[:limit] if limit else ids
+    typ, data = M.search(None, "ALL")
+    if typ != "OK":
+        return []
+    ids = [i for i in data[0].split() if i]
+    return ids[-limit:] if (limit and len(ids) > limit) else ids
+
+
+def _extract_payload(msg: email.message.Message) -> Tuple[str, str]:
     """
-    Extract best-effort plain text from an email.message.Message.
-    Prefer text/plain, else strip tags from text/html.
+    Returns (body_text, content_type_used). Prefers HTML part; falls back to text/plain.
     """
-    parts: List[str] = []
+    payload_bytes: Optional[bytes] = None
+    charset: Optional[str] = None
+    used = "text/plain"
+
     if msg.is_multipart():
+        # prefer HTML
         for part in msg.walk():
-            ctype = (part.get_content_type() or "").lower()
-            disp = (part.get("Content-Disposition") or "").lower()
-            if "attachment" in disp:
-                continue
-            if ctype == "text/plain":
-                try:
-                    parts.append(part.get_content().strip())
-                except Exception:
-                    try:
-                        parts.append(part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace"))
-                    except Exception:
-                        pass
-        if not parts:
-            # fallback to HTML
+            if (part.get_content_type() or "").lower() == "text/html":
+                payload_bytes = part.get_payload(decode=True)
+                charset = part.get_content_charset()
+                used = "text/html"
+                break
+        if payload_bytes is None:
             for part in msg.walk():
-                ctype = (part.get_content_type() or "").lower()
-                if ctype == "text/html":
-                    try:
-                        html = part.get_content()
-                    except Exception:
-                        try:
-                            html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace")
-                        except Exception:
-                            html = ""
-                    # dumb tag stripper
-                    text = re.sub(r"<[^>]+>", " ", html)
-                    text = re.sub(r"\s+", " ", text)
-                    parts.append(text.strip())
+                if (part.get_content_type() or "").lower() == "text/plain":
+                    payload_bytes = part.get_payload(decode=True)
+                    charset = part.get_content_charset()
+                    used = "text/plain"
+                    break
     else:
-        ctype = (msg.get_content_type() or "").lower()
+        payload_bytes = msg.get_payload(decode=True)
+        charset = msg.get_content_charset()
+        used = msg.get_content_type() or "text/plain"
+
+    if payload_bytes is None:
+        return "", used
+
+    # Decode robustly
+    try_order = [charset, "utf-8", "latin-1"]
+    for enc in try_order:
+        if not enc:
+            continue
         try:
-            content = msg.get_content()
+            return payload_bytes.decode(enc, errors="replace"), used
         except Exception:
-            try:
-                content = msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", errors="replace")
-            except Exception:
-                content = ""
-        if ctype == "text/plain":
-            parts.append(content.strip())
-        else:
-            # strip HTML if possible
-            text = re.sub(r"<[^>]+>", " ", content)
-            text = re.sub(r"\s+", " ", text)
-            parts.append(text.strip())
-
-    return "\n".join([p for p in parts if p]).strip()
+            continue
+    return payload_bytes.decode("utf-8", errors="replace"), used
 
 
-def _load_state(path: Path) -> set:
+def _load_state(path: Path) -> set[str]:
     try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            return set(data.get("seen_tx_ids", []))
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        # support both list and {"seen_tx_ids":[...]}
+        if isinstance(data, dict) and "seen_tx_ids" in data:
+            return set(map(str, data["seen_tx_ids"]))
+        return set(map(str, data))
     except FileNotFoundError:
         return set()
     except Exception:
         return set()
 
 
-def _save_state(path: Path, seen: set) -> None:
+def _save_state(path: Path, seen: set[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = {"seen_tx_ids": sorted(list(seen))}
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(tmp, f, ensure_ascii=False, indent=2)
+    path.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
 
 class Command(BaseCommand):
-    help = "Poll Gmail via IMAP, parse PayPal payment emails, and create Donation rows idempotently."
+    help = "Poll IMAP for PayPal confirmation emails and create Donation rows idempotently."
 
-   def add_arguments(self, parser):
-           parser.add_argument("--dry-run", action="store_true")
-           parser.add_argument("--debug", action="store_true")
-           parser.add_argument("--limit", type=int, default=int(os.getenv("IMAP_LIMIT", "50")))
-           parser.add_argument("--folder", default=os.getenv("IMAP_FOLDER", "INBOX"))
-           parser.add_argument("--mark-seen", default=os.getenv("IMAP_MARK_SEEN", "true").lower() == "true", action="store_true")
-           parser.add_argument("--state-file", default=os.getenv("PAYPAL_INGEST_STATE", STATE_DEFAULT))
+    def add_arguments(self, parser):
+        parser.add_argument("--dry-run", action="store_true", help="Parse and show results but do NOT write DB/state.")
+        parser.add_argument("--debug", action="store_true", help="Print parse failures with snippets.")
+        parser.add_argument("--limit", type=int, default=int(os.getenv("IMAP_LIMIT", "50")), help="Max emails to process.")
+        parser.add_argument("--folder", type=str, default=os.getenv("IMAP_FOLDER", "INBOX"), help="Mailbox folder.")
+        # boolean with env default + explicit override
+        env_mark_seen = os.getenv("IMAP_MARK_SEEN", "true").lower() == "true"
+        parser.add_argument("--mark-seen", dest="mark_seen", action="store_true", default=env_mark_seen,
+                            help="Mark processed emails as \\Seen.")
+        parser.add_argument("--no-mark-seen", dest="mark_seen", action="store_false", help="Do NOT mark as \\Seen.")
+        parser.add_argument("--state-file", type=str, default=os.getenv("PAYPAL_INGEST_STATE", ".paypal_ingest_state.json"),
+                            help="Path for idempotency state file.")
 
-       def handle(self, *args, **opts):
-           host = os.getenv("IMAP_HOST", "imap.gmail.com")
-           user = os.getenv("IMAP_USER")
-           pw   = os.getenv("IMAP_PASSWORD")
-           if not (user and pw):
-               self.stderr.write(self.style.ERROR("IMAP_USER/IMAP_PASSWORD missing"))
-               return
+    def handle(self, *args, **opts):
+        host = os.getenv("IMAP_HOST", "imap.gmail.com")
+        user = os.getenv("IMAP_USER")
+        password = os.getenv("IMAP_PASSWORD")
+        if not user or not password:
+            raise CommandError("IMAP_USER and IMAP_PASSWORD must be set (env).")
 
-           dry = opts["dry_run"]
-           debug = opts["debug"]
-           limit = opts["limit"]
-           folder = opts["folder"]
-           mark_seen = opts["mark_seen"]
-           state_path = Path(opts["state_file"])
-           if not state_path.is_absolute():
-               state_path = Path(os.getcwd()) / state_path
+        dry = bool(opts["dry_run"])
+        debug = bool(opts["debug"])
+        limit = max(1, int(opts["limit"])) if opts["limit"] else 50
+        folder = opts["folder"]
+        mark_seen = bool(opts["mark_seen"])
 
-           # load state
-           seen = set()
-           if state_path.exists():
-               try:
-                   seen = set(json.loads(state_path.read_text()))
-               except Exception:
-                   pass
+        state_path = Path(opts["state_file"])
+        if not state_path.is_absolute():
+            state_path = Path(os.getcwd()) / state_path
+        seen_tx = _load_state(state_path)
 
-           self.stdout.write(f"[{timezone.now().isoformat()}] Connecting IMAP {host} as {user}…")
+        self.stdout.write(self.style.HTTP_INFO(f"[{timezone.now().isoformat()}] Connecting IMAP {host} as {user}…"))
+        M = _imap_connect(host, user, password)
 
-           processed = created = parse_failed = already_seen = 0
+        processed = created = already_seen = parse_failed = 0
 
-           M = imaplib.IMAP4_SSL(host)
-           try:
-               M.login(user, pw)
-               M.select(folder)
-               typ, data = M.search(None, 'UNSEEN', 'FROM', '"service@paypal.de"')
-               if typ != "OK":
-                   typ, data = M.search(None, 'FROM', '"service@paypal.de"')
+        try:
+            _select_folder(M, folder)
+            ids = _search_ids(M, limit)
+            if not ids:
+                self.stdout.write(self.style.WARNING("No messages to process."))
+                return
 
-               ids = data[0].split()
-               ids = ids[-limit:] if limit else ids
+            for num in ids:
+                typ, data = M.fetch(num, "(RFC822)")
+                if typ != "OK" or not data:
+                    continue
 
-               for num in ids:
-                   typ, msg_data = M.fetch(num, "(RFC822)")
-                   if typ != "OK":
-                       continue
-                   msg = email.message_from_bytes(msg_data[0][1])
-                   subj = msg.get("Subject", "")
-                   frm = msg.get("From", "")
+                raw_bytes = data[0][1]
+                try:
+                    msg = email.message_from_bytes(raw_bytes)
+                except Exception:
+                    parse_failed += 1
+                    continue
 
-                   # prefer HTML part, else plain
-                   payload = None
-                   if msg.is_multipart():
-                       for part in msg.walk():
-                           ctype = part.get_content_type()
-                           if ctype == "text/html":
-                               payload = part.get_payload(decode=True)
-                               break
-                       if not payload:
-                           for part in msg.walk():
-                               if part.get_content_type() == "text/plain":
-                                   payload = part.get_payload(decode=True); break
-                   else:
-                       payload = msg.get_payload(decode=True)
+                subj = (msg.get("Subject") or "").strip()
+                frm = (msg.get("From") or "").strip()
 
-                   raw = (payload or b"").decode(part.get_content_charset() or "utf-8", errors="replace")
-                   data_parsed = parse_paypal_email(raw)
-                   processed += 1
+                # Quick allowlist: only attempt parse if it looks like PayPal
+                # Don't overfit here; the parser will fail fast otherwise.
+                if not (re.search(r"paypal", subj, re.I) or re.search(r"paypal", frm, re.I)):
+                    # Count as processed but parse_failed (skipped)
+                    processed += 1
+                    parse_failed += 1
+                    if mark_seen and not dry:
+                        M.store(num, "+FLAGS", "\\Seen")
+                    continue
 
-                   if not data_parsed:
-                       parse_failed += 1
-                       if debug:
-                           self.stdout.write(self.style.WARNING(f"Could not parse: subj='{subj}' from='{frm}'"))
-                       if mark_seen and not dry:
-                           M.store(num, "+FLAGS", "\\Seen")
-                       continue
+                body, ctype = _extract_payload(msg)
+                parsed = parse_paypal_email(body)
+                processed += 1
 
-                   tx = data_parsed["transaction_id"]
-                   amount: Decimal = data_parsed["amount"]
-                   payer = (data_parsed.get("payer_name") or "").strip()
+                if not parsed:
+                    parse_failed += 1
+                    if debug:
+                        snippet = body[:400].replace("\n", " ")
+                        self.stdout.write(self.style.WARNING(f"Could not parse: subj='{subj}' from='{frm}' ctype='{ctype}'"))
+                        self.stdout.write(self.style.HTTP_INFO(f"Snippet: {snippet}"))
+                    if mark_seen and not dry:
+                        M.store(num, "+FLAGS", "\\Seen")
+                    continue
 
-                   if tx in seen:
-                       already_seen += 1
-                       if mark_seen and not dry:
-                           M.store(num, "+FLAGS", "\\Seen")
-                       continue
+                tx = str(parsed["transaction_id"])
+                amount = parsed["amount"]  # Decimal
+                payer = (parsed.get("payer_name") or "").strip()
 
-                   donor_obj = None
-                   if payer:
-                       donor_obj = Donor.objects.filter(name__iexact=payer).first()
-                       if not donor_obj:
-                           donor_obj = Donor.objects.create(name=payer)
+                if tx in seen_tx:
+                    already_seen += 1
+                    if mark_seen and not dry:
+                        M.store(num, "+FLAGS", "\\Seen")
+                    continue
 
-                   if dry:
-                       self.stdout.write(self.style.HTTP_INFO(f"[DRY] Would create Donation: {amount} EUR (tx {tx})"
-                                                              + (f" for donor '{payer}'" if payer else "")))
-                   else:
-                       with transaction.atomic():
-                           kwargs = {"amount": amount}
-                           # support FK name donor/doner just in case
-                           donation_field_names = {f.name for f in Donation._meta.get_fields()}
-                           if donor_obj:
-                               if "donor" in donation_field_names:
-                                   kwargs["donor"] = donor_obj
-                               elif "doner" in donation_field_names:
-                                   kwargs["doner"] = donor_obj
-                           Donation.objects.create(**kwargs)
-                           seen.add(tx)
-                           if mark_seen:
-                               M.store(num, "+FLAGS", "\\Seen")
-                       created += 1
+                # Resolve/create donor if we have a name
+                donor_obj = None
+                if payer:
+                    # case-insensitive match
+                    if Donor is not None:
+                        donor_obj = Donor.objects.filter(name__iexact=payer).first()
+                        if not donor_obj:
+                            donor_obj = Donor.objects.create(name=payer)
+                    elif Doner is not None:
+                        donor_obj = Doner.objects.filter(name__iexact=payer).first()
+                        if not donor_obj:
+                            donor_obj = Doner.objects.create(name=payer)
 
-           finally:
-               try:
-                   M.close()
-               except Exception:
-                   pass
-               M.logout()
+                if dry:
+                    msg_line = f"[DRY] Would create Donation: {amount} EUR (tx {tx})"
+                    if donor_obj or payer:
+                        msg_line += f" for donor '{payer or donor_obj.name}'"
+                    self.stdout.write(self.style.HTTP_INFO(msg_line))
+                    # do NOT add to state in dry-run
+                    if mark_seen:
+                        # even in dry-run, you may prefer not to mark seen; keep current choice:
+                        pass
+                    continue
 
-           # persist state only on real run
-           if not dry:
-               try:
-                   state_path.write_text(json.dumps(sorted(seen)))
-               except Exception as e:
-                   self.stderr.write(self.style.ERROR(f"Failed to write state: {e}"))
+                # Real insert
+                with transaction.atomic():
+                    kwargs = {"amount": amount}
+                    field_names = {f.name for f in Donation._meta.get_fields()}
+                    if donor_obj:
+                        if "donor" in field_names:
+                            kwargs["donor"] = donor_obj
+                        elif "doner" in field_names:
+                            kwargs["doner"] = donor_obj
+                    Donation.objects.create(**kwargs)
+                    seen_tx.add(tx)
+                    created += 1
+                    if mark_seen:
+                        M.store(num, "+FLAGS", "\\Seen")
 
-           self.stdout.write(f"Done. processed={processed} created={created} already_seen={already_seen} parse_failed={parse_failed} state={state_path}")
+        finally:
+            try:
+                M.close()
+            except Exception:
+                pass
+            M.logout()
+
+        # Persist idempotency state only after real writes
+        if not dry:
+            try:
+                _save_state(state_path, seen_tx)
+            except Exception as e:
+                self.stderr.write(self.style.ERROR(f"Failed to write state: {e}"))
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Done. processed={processed} created={created} already_seen={already_seen} parse_failed={parse_failed} state={state_path}"
+            )
+        )
