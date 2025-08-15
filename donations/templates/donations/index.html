@@ -1,0 +1,166 @@
+<!-- donations/templates/donations/index.html -->
+{% csrf_token %}
+<!doctype html>
+<html lang="de">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ title|default:"Fundraiser" }}</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+        {% if paypal_client_id %}
+        <script src="https://www.paypal.com/sdk/js?client-id={{ paypal_client_id }}&currency=EUR&intent=capture"></script>
+        {% endif %}
+    </head>
+    <body
+        class="min-h-screen bg-neutral-950 text-neutral-100 flex items-center justify-center p-6"
+    >
+        <main class="w-full max-w-xl space-y-6">
+            <h1 class="text-3xl font-semibold text-center">
+                {{ title|default:"Fundraiser" }}
+            </h1>
+
+            <!-- Progress (HTMX) -->
+            <section
+                id="progress"
+                hx-get="{% url 'donations:progress' %}"
+                hx-trigger="load, every 3s, refresh from:body"
+                hx-swap="innerHTML"
+            >
+                <div class="space-y-2">
+                    <div class="flex items-baseline justify-between">
+                        <span class="text-sm text-neutral-400">Ziel</span>
+                        <span class="tabular-nums font-medium">–</span>
+                    </div>
+                    <div
+                        class="w-full h-4 bg-neutral-800 rounded-full overflow-hidden"
+                    >
+                        <div
+                            class="h-full bg-emerald-500 animate-pulse"
+                            style="width: 0%"
+                        ></div>
+                    </div>
+                    <div class="flex items-baseline justify-between">
+                        <span class="text-sm text-neutral-400"
+                            >Eingegangen</span
+                        >
+                        <span class="tabular-nums font-semibold">–</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Donation -->
+            {% if paypal_client_id %}
+            <section class="space-y-3">
+                <label class="block text-sm text-neutral-300"
+                    >Betrag (EUR)</label
+                >
+                <input
+                    id="amount"
+                    type="number"
+                    step="0.01"
+                    min="1"
+                    value="5.00"
+                    class="w-full rounded-lg bg-neutral-900 border border-neutral-800 px-3 py-2 text-neutral-100 outline-none focus:border-emerald-500"
+                />
+
+                <div id="paypal-button-container"></div>
+
+                <p id="status" class="text-xs text-neutral-400"></p>
+            </section>
+
+            <script>
+                // --- CSRF helper (Django) ---
+                function getCookie(name) {
+                    const value = `; ${document.cookie}`;
+                    const parts = value.split(`; ${name}=`);
+                    if (parts.length === 2)
+                        return parts.pop().split(";").shift();
+                }
+                const csrftoken = getCookie("csrftoken");
+
+                // --- PayPal Buttons ---
+                paypal
+                    .Buttons({
+                        style: { layout: "horizontal", tagline: false },
+                        createOrder: function (data, actions) {
+                            const raw =
+                                document.getElementById("amount").value ||
+                                "5.00";
+                            // Normalize decimal separator and clamp
+                            let value = String(raw).replace(",", ".");
+                            let num = parseFloat(value);
+                            if (!isFinite(num) || num < 1) num = 5.0;
+                            value = num.toFixed(2);
+                            return actions.order.create({
+                                purchase_units: [
+                                    {
+                                        amount: { currency_code: "EUR", value },
+                                    },
+                                ],
+                            });
+                        },
+                        onApprove: async function (data, actions) {
+                            try {
+                                // Capture on client so the order has a COMPLETED capture
+                                const details = await actions.order.capture();
+                                const orderID = data.orderID;
+
+                                // Tell our backend to verify + record the donation
+                                const r = await fetch("/api/capture/", {
+                                    method: "POST",
+                                    headers: {
+                                        "Content-Type": "application/json",
+                                        "X-CSRFToken": csrftoken || "",
+                                    },
+                                    body: JSON.stringify({ order_id: orderID }),
+                                });
+
+                                if (!r.ok) {
+                                    const err = await r
+                                        .json()
+                                        .catch(() => ({}));
+                                    document.getElementById(
+                                        "status",
+                                    ).textContent =
+                                        "Fehler beim Verbuchen: " +
+                                        (err.error || r.status);
+                                    return;
+                                }
+
+                                document.getElementById("status").textContent =
+                                    "Danke! Zahlung erfasst.";
+                                // Trigger an immediate HTMX refresh of the progress
+                                if (window.htmx) {
+                                    htmx.trigger(document.body, "refresh");
+                                }
+                            } catch (e) {
+                                document.getElementById("status").textContent =
+                                    "Abgebrochen oder fehlgeschlagen.";
+                            }
+                        },
+                        onError: function (err) {
+                            document.getElementById("status").textContent =
+                                "PayPal-Fehler.";
+                        },
+                    })
+                    .render("#paypal-button-container");
+            </script>
+            {% else %}
+            <!-- Fallback if no PayPal client ID configured -->
+            <section class="space-y-3">
+                <a
+                    href="https://www.paypal.me/raheldoege"
+                    class="block w-full text-center rounded-xl bg-blue-500 hover:bg-blue-600 active:bg-blue-700 px-4 py-3 font-semibold"
+                >
+                    Mit PayPal spenden
+                </a>
+                <p class="text-xs text-neutral-400 text-center">
+                    Hinweis: Für die direkte API-Integration bitte
+                    PAYPAL_CLIENT_ID & PAYPAL_SECRET setzen.
+                </p>
+            </section>
+            {% endif %}
+        </main>
+    </body>
+</html>

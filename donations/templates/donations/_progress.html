@@ -1,0 +1,18 @@
+<div class="space-y-2">
+    <div class="flex items-baseline justify-between">
+        <span class="text-sm text-neutral-400">Ziel</span>
+        <span class="tabular-nums font-medium">€{{ target }}</span>
+    </div>
+
+    <div class="w-full h-4 bg-neutral-800 rounded-full overflow-hidden">
+        <div
+            class="h-full bg-emerald-500 transition-all duration-500"
+            style="width: {{ percent }}%"
+        ></div>
+    </div>
+
+    <div class="flex items-baseline justify-between">
+        <span class="text-sm text-neutral-400">Eingegangen</span>
+        <span class="tabular-nums font-semibold">€{{ total }}</span>
+    </div>
+</div>
