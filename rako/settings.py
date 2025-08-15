@@ -2,7 +2,6 @@
 from pathlib import Path
 import os
 import urllib.parse
-from celery.schedules import crontab  # only used if you prefer cron syntax
 
 # -----------------------------------------------------------------------------
 # Core
