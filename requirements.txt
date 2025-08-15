@@ -12,6 +12,7 @@ cron-descriptor==1.4.5
 Django==5.2.5
 django-celery-beat==2.8.1
 django-timezone-field==7.1
+gunicorn==23.0.0
 idna==3.10
 iniconfig==2.1.0
 kombu==5.5.4
