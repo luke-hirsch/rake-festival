@@ -165,9 +165,13 @@ class Command(BaseCommand):
                 except Exception:
                     parse_failed += 1
                     continue
-
                 subj = (msg.get("Subject") or "").strip()
-                frm = (msg.get("From") or "").strip()
+                frm  = (msg.get("From") or "").strip()
+
+                # Normalize Message-ID (remove angle brackets)
+                msgid_raw = msg.get("Message-ID") or msg.get("Message-Id") or ""
+                msgid = msgid_raw.strip().strip("<>").strip() or ""
+
 
                 # Quick allowlist: only attempt parse if it looks like PayPal
                 # Don't overfit here; the parser will fail fast otherwise.
@@ -228,8 +232,13 @@ class Command(BaseCommand):
                     continue
 
                 # Real insert
+                if msgid and Donation.objects.filter(message_id=msgid).exists():
+                    already_seen += 1
+                    if mark_seen and not dry:
+                        M.store(num, "+FLAGS", "\\Seen")
+                    continue
                 with transaction.atomic():
-                    kwargs = {"amount": amount}
+                    kwargs = {"amount": amount, "message_id": msgid or None}
                     field_names = {f.name for f in Donation._meta.get_fields()}
                     if donor_obj:
                         if "donor" in field_names:
