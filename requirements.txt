@@ -17,6 +17,7 @@ idna==3.10
 iniconfig==2.1.0
 kombu==5.5.4
 packaging==25.0
+pillow==11.3.0
 pluggy==1.6.0
 prompt_toolkit==3.0.51
 Pygments==2.19.2
