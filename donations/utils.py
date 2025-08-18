@@ -19,15 +19,27 @@ _AMT_FALLBACK_RE = re.compile(
 )
 
 # Payer name from hero line, e.g. "Max Mustermann hat dir ... gesendet"
-_PAYER_RE = re.compile(r"([A-Za-zÄÖÜäöüß .'\-]+?)\s+hat\s+(?:dir|Ihnen)\s+.+?\bgesendet\b", re.I)
+_PAYER_HERO_RE = re.compile(r"([A-Za-zÄÖÜäöüß .'\-]+?)\s+hat\s+(?:dir|Ihnen)\s+.+?\bgesendet\b", re.I)
+# Payer name from labels
+_PAYER_LABEL_RE = re.compile(r"(?:From|Von)\s*[:\-]?\s*([^\n]+)", re.I)
+
+# Negative indicators (ignore these mails even if they have Betrag/Tx code)
+_NEGATIVE_RE = re.compile(
+    r"""(?xi)
+    (
+      \bDu\shast\s+eine\s+Zahlung\s+gesendet\b |
+      \bSie\shaben\s+eine\s+Zahlung\s+gesendet\b |
+      \bYou\s+sent\s+a\s+payment\b |
+      \bAbbuchung\b | \bwithdrawal\b | \bAuszahlung\b | \bBankkonto\b
+    )
+    """
+)
 
 def _strip_tags_to_text(s: str) -> str:
-    # unescape & replace <br> / </td> with newlines, then drop tags
     s = html.unescape(s or "")
     s = re.sub(r"(?i)<\s*br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</\s*(p|div|td|tr|li|h\d)\s*>", "\n", s)
     s = re.sub(r"<[^>]+>", " ", s)
-    # normalize whitespace (including exotic NBSPs)
     s = (
         s.replace("\xa0", " ").replace("\u202f", " ")
          .replace("\u2007", " ").replace("\u2009", " ")
@@ -45,15 +57,12 @@ def _normalize_amount_to_decimal(amount_str: str) -> Optional[Decimal]:
         .replace("\u2007", " ").replace("\u2009", " ")
         .replace("\r", " ").replace("\n", " ")
     ).strip()
-    # drop currency + spaces
     s = re.sub(r"(EUR|eur|€|\s)", "", s)
-
     has_comma, has_dot = ("," in s), ("." in s)
     if has_comma and has_dot:
-        # EU: 1.234,56
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
-        else:  # EN: 1,234.56
+        else:
             s = s.replace(",", "")
     elif has_comma:
         s = s.replace(",", ".")
@@ -63,14 +72,14 @@ def _normalize_amount_to_decimal(amount_str: str) -> Optional[Decimal]:
         return None
 
 def parse_paypal_email(raw: str) -> Optional[Dict[str, object]]:
-    """
-    Accepts raw HTML/text (already decoded from quoted-printable by email lib).
-    Returns dict: {transaction_id, amount(Decimal), currency='EUR', payer_name?}
-    """
     if not raw:
         return None
 
     text = _strip_tags_to_text(raw)
+
+    # bail early on non-received mails
+    if _NEGATIVE_RE.search(text):
+        return None
 
     txm = _TX_RE.search(text)
     if not txm:
@@ -85,8 +94,8 @@ def parse_paypal_email(raw: str) -> Optional[Dict[str, object]]:
         return None
 
     payer_name = ""
-    pm = _PAYER_RE.search(text)
-    if pm:
-        payer_name = pm.group(1).strip()
+    m = _PAYER_LABEL_RE.search(text) or _PAYER_HERO_RE.search(text)
+    if m:
+        payer_name = m.group(1).strip()
 
     return {"transaction_id": transaction_id, "amount": amount, "currency": "EUR", "payer_name": payer_name}

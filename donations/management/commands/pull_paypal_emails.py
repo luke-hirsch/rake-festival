@@ -184,7 +184,8 @@ class Command(BaseCommand):
                     continue
 
                 body, ctype = _extract_payload(msg)
-                parsed = parse_paypal_email(body)
+                text_for_parser = f"From: {frm}\nSubject: {subj}\n\n{body or ''}"
+                parsed = parse_paypal_email(text_for_parser)
                 processed += 1
 
                 if not parsed:

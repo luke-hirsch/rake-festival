@@ -4,7 +4,7 @@ from unittest.mock import patch
 from .utils import parse_paypal_email
 from django.test import TestCase, SimpleTestCase
 from django.urls import reverse
-
+from django.db import IntegrityError
 from donations.models import Donation
 
 
@@ -125,3 +125,67 @@ class CeleryTaskTests(SimpleTestCase):
             folder="INBOX",
             mark_seen=False,
         )
+
+
+class EmailParserRobustnessTests(SimpleTestCase):
+    def test_parse_payment_received_de_html(self):
+        raw = """
+        <html><body>
+          <h1>Lukas von Hirschhausen hat dir 1,00 € gesendet</h1>
+          <table>
+            <tr><td>Erhaltener Betrag</td><td>1,00 € EUR</td></tr>
+            <tr><td>Transaktionscode</td><td>8ABCD12345EFG</td></tr>
+          </table>
+        </body></html>
+        """
+        got = parse_paypal_email(raw)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["transaction_id"], "8ABCD12345EFG")
+        self.assertEqual(got["currency"], "EUR")
+        self.assertEqual(got["amount"], Decimal("1.00"))
+        # payer name may be present; if parser doesn’t find it, it’s fine
+        self.assertIn("payer_name", got)
+
+    def test_ignore_payment_sent_de(self):
+        # Looks legit (has Betrag + Transaktionscode) but is a "sent" mail → should be ignored
+        raw = """
+        <html><body>
+          <h1>Du hast eine Zahlung gesendet</h1>
+          <table>
+            <tr><td>Betrag</td><td>3,50 € EUR</td></tr>
+            <tr><td>Transaktionscode</td><td>9SENT99999999</td></tr>
+          </table>
+        </body></html>
+        """
+        self.assertIsNone(parse_paypal_email(raw))
+
+    def test_ignore_withdrawal_success(self):
+        raw = """
+        <html><body>
+          <h1>Ihre Abbuchung war erfolgreich.</h1>
+          <p>Sie haben Geld von Ihrem PayPal-Konto auf Ihr Bankkonto abgebucht.</p>
+          <table>
+            <tr><td>Betrag</td><td>25,00 € EUR</td></tr>
+          </table>
+        </body></html>
+        """
+        self.assertIsNone(parse_paypal_email(raw))
+
+    def test_ignore_withdrawal_info(self):
+        raw = """
+        <html><body>
+          <h1>Informationen zur letzten Abbuchung</h1>
+          <p>Ihre Abbuchung konnte nicht verarbeitet werden.</p>
+          <table>
+            <tr><td>Betrag</td><td>25,00 € EUR</td></tr>
+          </table>
+        </body></html>
+        """
+        self.assertIsNone(parse_paypal_email(raw))
+
+
+class MessageIdUniquenessTests(TestCase):
+    def test_message_id_unique(self):
+        Donation.objects.create(amount=Decimal("1.00"), message_id="msg-abc")
+        with self.assertRaises(IntegrityError):
+            Donation.objects.create(amount=Decimal("2.00"), message_id="msg-abc")
